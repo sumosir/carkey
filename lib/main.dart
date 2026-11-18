@@ -84,6 +84,9 @@ class _CarKeyHomePageState extends State<CarKeyHomePage> {
   /// 连续重连失败次数
   int _reconnectAttempts = 0;
 
+  /// 本轮扫描是否至少看到过一次目标设备
+  bool _sawTarget = false;
+
   Timer? _reconnectTimer;
   StreamSubscription<List<ScanResult>>? _scanSubscription;
   StreamSubscription<BluetoothConnectionState>? _connSubscription;
@@ -179,13 +182,24 @@ class _CarKeyHomePageState extends State<CarKeyHomePage> {
 
   // ==================== 扫描 ====================
 
+  /// 去掉空白/零宽字符并转小写，避免不可见字符导致匹配失败
+  String _normalize(String s) =>
+      s.replaceAll(RegExp(r'[\s\u200B-\u200D\uFEFF]'), '').toLowerCase();
+
   /// 名称匹配（platformName 在 iOS 上常为空，需同时看广播包名称）
   bool _isTarget(ScanResult r) {
-    final target = _targetDeviceName.toLowerCase();
+    final target = _normalize(_targetDeviceName);
     return <String>[
       r.device.platformName,
       r.advertisementData.advName,
-    ].any((n) => n.toLowerCase().contains(target));
+    ].any((raw) {
+      final n = _normalize(raw);
+      if (n.isEmpty) return false;
+      // 双向包含：设备名可能被截断或带后缀
+      return n == target ||
+          n.contains(target) ||
+          (n.length >= 4 && target.contains(n));
+    });
   }
 
   Future<void> _startScan() async {
@@ -201,6 +215,7 @@ class _CarKeyHomePageState extends State<CarKeyHomePage> {
         _statusText = _boundDeviceId == null ? '正在搜索 CarKey...' : '正在寻找已绑定的设备...';
         _hint = null;
         _found.clear();
+        _sawTarget = false;
       });
     }
 
@@ -219,7 +234,9 @@ class _CarKeyHomePageState extends State<CarKeyHomePage> {
       for (final r in results) {
         final id = r.device.remoteId.str;
         final isBound = _boundDeviceId != null && id == _boundDeviceId;
-        if (isBound || _isTarget(r)) {
+        final isTarget = _isTarget(r);
+        if (isTarget) _sawTarget = true;
+        if (isBound || isTarget) {
           _connectToDevice(r.device);
           return;
         }
@@ -246,15 +263,21 @@ class _CarKeyHomePageState extends State<CarKeyHomePage> {
     if (mounted && _state == ConnState.scanning) {
       setState(() {
         _state = ConnState.idle;
-        _statusText = '未发现 CarKey';
-        _hint = _found.isEmpty
-            ? '没有扫描到任何蓝牙设备\n'
-                '1. 确认手机蓝牙已开启\n'
-                '2. 确认开发板已通电\n'
-                '3. 如果安卓手机正连着开发板，请先断开它（开发板只支持 1 个连接）'
-            : '已发现 ${_found.length} 个其他蓝牙设备，但没有 CarKey\n'
-                '开发板可能已被其他手机占用连接（此时会停止广播）\n'
-                '请把安卓手机的蓝牙关掉后再试';
+        _statusText = _sawTarget ? '已发现 CarKey，但未连上' : '未发现 CarKey';
+        if (_sawTarget) {
+          _hint = '已发现 CarKey 但连接失败\n'
+              '1. 确认没有其他手机连着它（开发板只支持 1 个连接）\n'
+              '2. 若换过固件，请点「清除配对记录」后重试';
+        } else if (_found.isEmpty) {
+          _hint = '没有扫描到任何蓝牙设备\n'
+              '1. 确认手机蓝牙已开启\n'
+              '2. 确认开发板已通电\n'
+              '3. 如果安卓手机正连着开发板，请先断开它（开发板只支持 1 个连接）';
+        } else {
+          _hint = '已发现 ${_found.length} 个其他蓝牙设备，但没有 CarKey\n'
+              '开发板可能已被其他手机占用连接（此时会停止广播）\n'
+              '请把安卓手机的蓝牙关掉后再试';
+        }
       });
     }
   }
@@ -269,48 +292,92 @@ class _CarKeyHomePageState extends State<CarKeyHomePage> {
     _connecting = true;
 
     try {
-      await FlutterBluePlus.stopScan();
-    } catch (_) {}
-    await _scanSubscription?.cancel();
-    _scanSubscription = null;
+      try {
+        await FlutterBluePlus.stopScan();
+      } catch (_) {}
+      await _scanSubscription?.cancel();
+      _scanSubscription = null;
 
-    _device = device;
-    if (mounted) {
-      setState(() {
-        _state = ConnState.connecting;
-        _statusText = '正在连接...';
-        _hint = null;
-      });
-    }
-
-    await _connSubscription?.cancel();
-    _connSubscription = device.connectionState.listen((s) {
-      if (s == BluetoothConnectionState.connected) {
-        _onConnected();
-      } else if (s == BluetoothConnectionState.disconnected) {
-        _onDisconnected();
+      _device = device;
+      if (mounted) {
+        setState(() {
+          _state = ConnState.connecting;
+          _statusText = '正在连接...';
+          _hint = null;
+        });
       }
-    });
 
-    try {
-      await device.connect(
-        autoConnect: autoConnect,
-        timeout: const Duration(seconds: 15),
-      );
-      _reconnectAttempts = 0;
-    } catch (e) {
+      await _connSubscription?.cancel();
+      _connSubscription = device.connectionState.listen((s) {
+        if (s == BluetoothConnectionState.connected) {
+          _onConnected();
+        } else if (s == BluetoothConnectionState.disconnected) {
+          _onDisconnected();
+        }
+      });
+
+      // 先用普通方式连接（快）；失败再用 autoConnect（iOS 后台更可靠）
+      bool ok = await _tryConnect(device, autoConnect);
+      if (!ok) {
+        if (mounted) setState(() => _statusText = '连接失败，重试中...');
+        await Future.delayed(const Duration(seconds: 1));
+        ok = await _tryConnect(device, true);
+      }
+
+      if (ok) {
+        _reconnectAttempts = 0;
+        return;
+      }
+
       _reconnectAttempts++;
       if (mounted) {
         setState(() {
           _state = ConnState.idle;
           _statusText = '连接失败';
-          _hint = '连接失败：$e';
+          _hint = null;
         });
       }
+      await _showConnectFailedDialog();
       _scheduleReconnect();
     } finally {
       _connecting = false;
     }
+  }
+
+  /// 尝试连接一次，返回是否成功
+  Future<bool> _tryConnect(BluetoothDevice device, bool autoConnect) async {
+    try {
+      await device.connect(
+        autoConnect: autoConnect,
+        timeout: const Duration(seconds: 10),
+      );
+      return true;
+    } catch (e) {
+      debugPrint('连接失败(autoConnect=$autoConnect): $e');
+      return false;
+    }
+  }
+
+  /// 连接失败提示
+  Future<void> _showConnectFailedDialog() async {
+    if (!mounted) return;
+    await showDialog<void>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text('连接失败'),
+        content: const Text(
+          '1. 确认没有其他手机连着 CarKey（开发板只支持 1 个连接）\n\n'
+          '2. 若换过固件，点「清除配对记录」，然后重新搜索\n\n'
+          '3. 关掉手机蓝牙再打开，重新搜索',
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(ctx),
+            child: const Text('知道了'),
+          ),
+        ],
+      ),
+    );
   }
 
   Future<void> _onConnected() async {
